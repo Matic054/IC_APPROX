@@ -1,5 +1,7 @@
 # Repository for Comparing Independent Cascade Approximation Methods
 
+The repo contains:
+
 - diffusion_models: Implementation of the approximation methods, and edge probability methods
 - graph_generation: For generating BA, ER, and FF graphs
 - soc-*: contain the raw data for real-world graphs
