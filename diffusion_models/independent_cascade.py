@@ -910,3 +910,202 @@ def fixed_point_probs(G, edge_probs, prior_probs, max_iter=1000, tol=1e-9, eps=1
         p = new_p
     
     return p
+
+from collections import deque
+
+def _directed_multi_source_bfs_dist(G, nodes, idx, sources):
+    """
+    Multi-source BFS on directed edges (u -> v).
+    Returns dist array of length n with np.inf for unreachable.
+    """
+    n = len(nodes)
+    dist = np.full(n, np.inf, dtype=np.float64)
+    q = deque()
+
+    for u in sources:
+        if u in idx:
+            i = idx[u]
+            if dist[i] != 0.0:
+                dist[i] = 0.0
+                q.append(u)
+
+    while q:
+        u = q.popleft()
+        du = dist[idx[u]]
+        for v in G.successors(u):
+            j = idx[v]
+            if dist[j] == np.inf:
+                dist[j] = du + 1.0
+                q.append(v)
+
+    return dist
+
+
+def SPM(G, prior_probs, edge_probs, eps=1e-12, seed_eps=0.0):
+    """
+    Shortest-Path Model (SPM) influence estimator following Kimura & Saito (PKDD 2006).
+
+    - Define A = {u : prior_probs[u] > seed_eps}
+    - d(A,v) = directed shortest-path length from A to v
+    - Pt(v) is the probability v FIRST becomes active at step t
+    - Under the paper's independence approximation:
+        Pt(v) = 1 - Π_{u in PA(v)} (1 - p_{uv} * P_{t-1}(u))
+      and Pt(v)=0 unless t=d(A,v)
+    - Per-node estimate returned: P_{d(A,v)}(v)
+    """
+    nodes = list(G.nodes())
+    n = len(nodes)
+    idx = {u: i for i, u in enumerate(nodes)}
+
+    p0 = np.asarray(prior_probs, dtype=np.float64)
+    if p0.shape[0] != n:
+        raise ValueError("prior_probs must be a length-|V| array aligned with list(G.nodes()).")
+    p0 = np.clip(p0, 0.0, 1.0)
+
+    # Seed set A (originally a deterministic set was used; here we use thresholded prior > 0)
+    sources = [nodes[i] for i in range(n) if p0[i] > seed_eps]
+    if not sources:
+        return np.zeros(n, dtype=np.float64)
+
+    dist = _directed_multi_source_bfs_dist(G, nodes, idx, sources)
+
+    # Need to compute up to max d(A,v) within horizon T
+    finite = np.isfinite(dist)
+    if not np.any(finite):
+        return np.zeros(n, dtype=np.float64)
+
+    max_d = int(np.max(dist[finite]))  # largest distance we care about
+    max_d = max(0, max_d)
+
+    # Build edge arrays
+    src, dst, p_e = [], [], []
+    for (u, v) in G.edges():
+        src.append(idx[u])
+        dst.append(idx[v])
+        p_e.append(float(edge_probs.get((u, v), 0.0)))
+
+    src = np.asarray(src, dtype=np.int32)
+    dst = np.asarray(dst, dtype=np.int32)
+    p_e = np.asarray(p_e, dtype=np.float64)
+    m = len(src)
+
+    # No edges: only seeds activate at t=0
+    if m == 0:
+        out = np.zeros(n, dtype=np.float64)
+        out[dist == 0] = p0[dist == 0]
+        return out
+
+    # Incoming-edge aggregator: for each node v, sum logs over edges ending at v
+    A_in = csr_matrix(
+        (np.ones(m, dtype=np.float64), (dst, np.arange(m, dtype=np.int32))),
+        shape=(n, m),
+        dtype=np.float64,
+    )
+
+    # Pt arrays: we only need Pt-1 to compute Pt, but we also need to read P_{d(v)}
+    P = np.zeros((max_d + 1, n), dtype=np.float64)
+
+    P[0] = p0
+
+    for t in range(1, max_d + 1):
+        x_e = p_e * P[t - 1, src]
+        x_e = np.clip(x_e, 0.0, 1.0 - eps)
+        # prod over parents: Π (1 - p_uv * P_{t-1}(u))
+        prod = np.exp(A_in.dot(np.log1p(-x_e)))
+        P[t] = np.clip(1.0 - prod, 0.0, 1.0)
+
+    # Return per-node estimate: P_{d(A,v)}(v), 0 if unreachable or d>T
+    out = np.zeros(n, dtype=np.float64)
+    d_int = dist.astype(np.int64, copy=False)
+    valid = np.isfinite(dist) & (d_int >= 0) & (d_int <= max_d)
+    out[valid] = P[d_int[valid], np.arange(n)[valid]]
+
+    return np.clip(out, 0.0, 1.0)
+
+
+def SP1M(G, prior_probs, edge_probs, eps=1e-12, seed_eps=0.0):
+    """
+    SP1 Model (SP1M) influence estimator following Kimura & Saito (PKDD 2006).
+
+    Same setup as SPM, but nodes can activate only at t=d(A,v) or t=d(A,v)+1.
+
+    The paper's estimator uses:
+      Pt(v) = (1 - P_{t-1}(v)) * [ 1 - Π_{u in PA(v)} (1 - p_{uv} * P_{t-1}(u)) ]
+
+    Per-node estimate returned: P_d(v) + P_{d+1}(v)
+    (these are disjoint by construction because of the (1 - P_{t-1}(v)) factor).
+    """
+    nodes = list(G.nodes())
+    n = len(nodes)
+    idx = {u: i for i, u in enumerate(nodes)}
+
+    p0 = np.asarray(prior_probs, dtype=np.float64)
+    if p0.shape[0] != n:
+        raise ValueError("prior_probs must be a length-|V| array aligned with list(G.nodes()).")
+    p0 = np.clip(p0, 0.0, 1.0)
+
+    sources = [nodes[i] for i in range(n) if p0[i] > seed_eps]
+    if not sources:
+        return np.zeros(n, dtype=np.float64)
+
+    dist = _directed_multi_source_bfs_dist(G, nodes, idx, sources)
+    finite = np.isfinite(dist)
+    if not np.any(finite):
+        return np.zeros(n, dtype=np.float64)
+
+    # We need up to max(d)+1 (within horizon T)
+    max_d1 = int(np.max(dist[finite]) + 1.0)
+    max_d1 = max(0, max_d1)
+
+    # Build edge arrays
+    src, dst, p_e = [], [], []
+    for (u, v) in G.edges():
+        src.append(idx[u])
+        dst.append(idx[v])
+        p_e.append(float(edge_probs.get((u, v), 0.0)))
+
+    src = np.asarray(src, dtype=np.int32)
+    dst = np.asarray(dst, dtype=np.int32)
+    p_e = np.asarray(p_e, dtype=np.float64)
+    m = len(src)
+
+    if m == 0:
+        out = np.zeros(n, dtype=np.float64)
+        out[dist == 0] = p0[dist == 0]
+        return out
+
+    A_in = csr_matrix(
+        (np.ones(m, dtype=np.float64), (dst, np.arange(m, dtype=np.int32))),
+        shape=(n, m),
+        dtype=np.float64,
+    )
+
+    # Pt for t=0..max_d1
+    P = np.zeros((max_d1 + 1, n), dtype=np.float64)
+    P[0] = p0
+
+    for t in range(1, max_d1 + 1):
+        x_e = p_e * P[t - 1, src]
+        x_e = np.clip(x_e, 0.0, 1.0 - eps)
+        prod = np.exp(A_in.dot(np.log1p(-x_e)))
+        base = np.clip(1.0 - prod, 0.0, 1.0)
+
+        # SP1M “first activation” correction:
+        # Pt(v) = (1 - P_{t-1}(v)) * base(v)
+        P[t] = np.clip((1.0 - P[t - 1]) * base, 0.0, 1.0)
+
+    # Output: P_d(v) + P_{d+1}(v), respecting horizon
+    out = np.zeros(n, dtype=np.float64)
+    d = dist.astype(np.int64, copy=False)
+    ar = np.arange(n)
+
+    valid_d = np.isfinite(dist) & (d >= 0) & (d <= max_d1)
+    P_d = np.zeros(n, dtype=np.float64)
+    P_d[valid_d] = P[d[valid_d], ar[valid_d]]
+
+    valid_d1 = np.isfinite(dist) & (d + 1 >= 0) & (d + 1 <= max_d1)
+    P_d1 = np.zeros(n, dtype=np.float64)
+    P_d1[valid_d1] = P[(d[valid_d1] + 1), ar[valid_d1]]
+
+    out = P_d + P_d1
+    return np.clip(out, 0.0, 1.0)
